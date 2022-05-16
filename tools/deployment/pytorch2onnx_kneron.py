@@ -12,7 +12,37 @@ from mmcv.runner import load_checkpoint
 
 from mmcls.models import build_classifier
 
+#from onnx import optimizer
+import onnx
+from optimizer_scripts.tools import eliminating
+from optimizer_scripts.tools import fusing
+from optimizer_scripts.tools import replacing
+from optimizer_scripts.tools import other
+from optimizer_scripts.tools import combo
+from optimizer_scripts.tools import special
+
 torch.manual_seed(3)
+
+
+def torch_exported_onnx_flow(m: onnx.ModelProto,
+                             disable_fuse_bn=False) -> onnx.ModelProto:
+    """Optimize the Pytorch exported onnx.
+
+    Args:
+        m (ModelProto): the input onnx model
+        disable_fuse_bn (bool, optional): do not fuse BN into Conv. Defaults to False.
+
+    Returns:
+        ModelProto: the optimized onnx model
+    """
+    m = combo.preprocess(m, disable_fuse_bn)
+    m = combo.pytorch_constant_folding(m)
+
+    m = combo.common_optimization(m)
+
+    m = combo.postprocess(m)
+
+    return m
 
 
 def _demo_mm_inputs(input_shape, num_classes):
@@ -38,12 +68,15 @@ def _demo_mm_inputs(input_shape, num_classes):
 
 def pytorch2onnx(model,
                  input_shape,
+                 normalize_cfg,
                  opset_version=11,
                  dynamic_export=False,
                  show=False,
                  output_file='tmp.onnx',
                  do_simplify=False,
-                 verify=False):
+                 verify=False,
+                 is_original_forward=False,
+                 in_model_preprocess=False):
     """Export Pytorch model to ONNX model and verify the outputs are same
     between Pytorch and ONNX.
 
@@ -76,9 +109,19 @@ def pytorch2onnx(model,
 
     # replace original forward function
     origin_forward = model.forward
-    model.forward = partial(model.forward, img_metas={}, return_loss=False)
+    #model.forward = partial(model.forward, img_metas={}, return_loss=False)
+    # is_original_forward or if postprocess
+    if not is_original_forward:
+        model.forward = partial(
+            model.forward,
+            img_metas={},
+            return_loss=False,
+            softmax=False,
+            post_process=False)
+    else:
+        model.forward = partial(
+            model.forward, img_metas={}, return_loss=False, post_process=False)
     register_extra_symbolics(opset_version)
-
     # support dynamic shape export
     if dynamic_export:
         dynamic_axes = {
@@ -93,7 +136,6 @@ def pytorch2onnx(model,
         }
     else:
         dynamic_axes = {}
-
     with torch.no_grad():
         torch.onnx.export(
             model, (img_list, ),
@@ -106,17 +148,76 @@ def pytorch2onnx(model,
             verbose=show,
             opset_version=opset_version)
         print(f'Successfully exported ONNX model: {output_file}')
+
+    print("#####  add BN for doing input data normalization  #####")
+    import onnxsim
+    import onnx
+    from mmdet import digit_version
+
+    min_required_version = '0.3.0'
+    assert digit_version(onnxsim.__version__) >= digit_version(
+        min_required_version
+    ), f'Requires to install onnx-simplify>={min_required_version}'
+
+    input_dic = {'input': img_list[0].detach().cpu().numpy()}
+    model_opt, check_ok = onnxsim.simplify(
+        output_file,
+        input_data=input_dic,
+        dynamic_input_shape=dynamic_export)
+    if check_ok:
+        onnx.save(model_opt, output_file)
+        print(f'Successfully simplified ONNX model: {output_file}')
+    else:
+        warnings.warn('Failed to simplify ONNX model.')
+    print(f'Successfully exported ONNX model: {output_file}')
+    # print(normalize_cfg)
+    m = onnx.load(output_file)
+    #print(len(m.graph.input))
+    m = torch_exported_onnx_flow(m, disable_fuse_bn=False)
+
+    if len(m.graph.input) > 1:
+        raise ValueError(
+            " '--pixel-bias-value' and '--pixel-scale-value' only support one input node model currently"
+        )
+
+    if in_model_preprocess is True:
+        mean = normalize_cfg['mean']
+        std = normalize_cfg['std']
+
+        i_n = m.graph.input[0]
+        if i_n.type.tensor_type.shape.dim[1].dim_value != len(
+                mean
+        ) or i_n.type.tensor_type.shape.dim[1].dim_value != len(std):
+            raise ValueError(
+                "--pixel-bias-value (" + str(mean) +
+                ") and --pixel-scale-value (" + str(std) +
+                ") should be same as input dimension:" +
+                str(i_n.type.tensor_type.shape.dim[1].dim_value))
+
+        # add 128 for changing input range from 0~255 to -128~127 (int8) due to quantization due to quantization limitation
+        normalize_bn_bias = [
+            -1 * mean[0] / std[0] + 128.0 / std[0],
+            -1 * mean[1] / std[1] + 128.0 / std[1],
+            -1 * mean[2] / std[2] + 128.0 / std[2]
+        ]
+        normalize_bn_scale = [1 / std[0], 1 / std[1], 1 / std[2]]
+
+        other.add_shift_scale_bn_after(m.graph, i_n.name,
+                                       normalize_bn_bias,
+                                       normalize_bn_scale)
+        m = onnx.utils.polish_model(m)
+
+    onnx_out = output_file[:-5] + '_kneron_optimized.onnx'
+    onnx.save(m, onnx_out)
+    print("exported success: ", onnx_out)
+
+    return
+
     model.forward = origin_forward
 
     if do_simplify:
         import onnx
         import onnxsim
-        from mmcv import digit_version
-
-        min_required_version = '0.3.0'
-        assert digit_version(mmcv.__version__) >= digit_version(
-            min_required_version
-        ), f'Requires to install onnx-simplify>={min_required_version}'
 
         if dynamic_axes:
             input_shape = (input_shape[0], input_shape[1], input_shape[2] * 2,
@@ -178,6 +279,8 @@ def parse_args():
     parser.add_argument('--checkpoint', help='checkpoint file', default=None)
     parser.add_argument('--show', action='store_true', help='show onnx graph')
     parser.add_argument(
+        '--is-original-forward', action='store_true', help='use original forward')
+    parser.add_argument(
         '--verify', action='store_true', help='verify the onnx model')
     parser.add_argument('--output-file', type=str, default='tmp.onnx')
     parser.add_argument('--opset-version', type=int, default=11)
@@ -221,17 +324,19 @@ if __name__ == '__main__':
 
     if args.checkpoint:
         load_checkpoint(classifier, args.checkpoint, map_location='cpu')
-
+    normalize_cfg = {'mean': cfg['NORM_MEAN'], 'std': cfg['NORM_STD']}
     # convert model to onnx file
     pytorch2onnx(
         classifier,
         input_shape,
+        normalize_cfg,
         opset_version=args.opset_version,
         show=args.show,
         dynamic_export=args.dynamic_export,
         output_file=args.output_file,
         do_simplify=args.simplify,
-        verify=args.verify)
+        verify=args.verify,
+        is_original_forward=args.is_original_forward)
 
     # Following strings of text style are from colorama package
     bright_style, reset_style = '\x1b[1m', '\x1b[0m'

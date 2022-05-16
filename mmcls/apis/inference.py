@@ -90,6 +90,75 @@ def inference_model(model, img):
     return result
 
 
+def set_kn_params_to_model_for_kn_inference_model(model,
+                                                  onnx_model_sess=None,
+                                                  kneron_plus_params=None):
+    if hasattr(model, '__Kn_ONNX_Sess__'):
+        delattr(model, '__Kn_ONNX_Sess__')
+    if hasattr(model, '__Kn_PLUS_Params__'):
+        delattr(model, '__Kn_PLUS_Params__')
+
+    if onnx_model_sess != None:
+        setattr(model, '__Kn_ONNX_Sess__', onnx_model_sess)
+    elif kneron_plus_params != None:
+        setattr(model, '__Kn_PLUS_Params__', kneron_plus_params)
+
+
+def inference_model_kn(model,
+                       img,
+                       onnx_model_sess=None,
+                       kneron_plus_params=None):
+    """Inference image(s) with the classifier.
+
+    Args:
+        model (nn.Module): The loaded classifier.
+        img (str/ndarray): The image filename or loaded image.
+
+    Returns:
+        result (dict): The classification results that contains
+            `class_name`, `pred_label` and `pred_score`.
+    """
+    cfg = model.cfg
+    device = next(model.parameters()).device  # model device
+    # build the data pipeline
+    if isinstance(img, str):
+        if cfg.data.test.pipeline[0]['type'] != 'LoadImageFromFile':
+            cfg.data.test.pipeline.insert(0, dict(type='LoadImageFromFile'))
+        data = dict(img_info=dict(filename=img), img_prefix=None)
+    else:
+        if cfg.data.test.pipeline[0]['type'] == 'LoadImageFromFile':
+            cfg.data.test.pipeline.pop(0)
+        data = dict(img=img)
+    test_pipeline = Compose(cfg.data.test.pipeline)
+
+    assert hasattr(
+        model, 'forward_kneron'), 'Error: None implement kneron forward type'
+
+    if onnx_model_sess != None:
+        set_kn_params_to_model_for_kn_inference_model(
+            model, onnx_model_sess=onnx_model_sess)
+    elif kneron_plus_params != None:
+        set_kn_params_to_model_for_kn_inference_model(
+            model, kneron_plus_params=kneron_plus_params)
+
+    model.forward = model.forward_kneron
+
+    data = test_pipeline(data)
+    data = collate([data], samples_per_gpu=1)
+    if next(model.parameters()).is_cuda:
+        # scatter to specified GPU
+        data = scatter(data, [device])[0]
+
+    # forward the model
+    with torch.no_grad():
+        scores = model(return_loss=False, **data)
+        pred_score = np.max(scores, axis=1)[0]
+        pred_label = np.argmax(scores, axis=1)[0]
+        result = {'pred_label': pred_label, 'pred_score': float(pred_score)}
+    result['pred_class'] = model.CLASSES[result['pred_label']]
+    return result
+
+
 def show_result_pyplot(model,
                        img,
                        result,
@@ -118,3 +187,18 @@ def show_result_pyplot(model,
         fig_size=fig_size,
         win_name=title,
         wait_time=wait_time)
+
+
+if '__main__' == __name__:
+    import onnxruntime
+    onnx_sess = onnxruntime.InferenceSession(
+        '/datadisk/jason.kuo/mmclassification/tmp_kneron_optimized.onnx')
+    model = init_model(
+        '/datadisk/jason.kuo/mmclassification/configs/regnet/regnetx-400mf_8xb128_in1k_normalize.py',
+        '/datadisk/jason.kuo/mmclassification/work_dirs/regnetx-400mf_8xb128_in1k_normalize/latest.pth'
+    )
+    result = inference_model_kn(
+        model,
+        '/datadisk/jason.kuo/mmclassification_git/data/imagenet/val/ILSVRC2012_val_00000001.JPEG',
+        onnx_sess)
+    print(result)

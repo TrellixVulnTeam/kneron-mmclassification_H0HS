@@ -1,4 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import torch
+import torch.nn.functional as F
 import copy
 import warnings
 
@@ -218,3 +220,31 @@ class ImageClassifier(BaseClassifier):
             raise e
 
         return res
+
+    def forward_kneron(self, img, return_loss=False, **kwargs):
+        """
+        Args:
+            imgs (List[Tensor]): the outer list indicates test-time
+                augmentations and inner Tensor should have a shape NxCxHxW,
+                which contains all images in the batch.
+        """
+        if isinstance(img, torch.Tensor):
+            img = [img]
+        for var, name in [(img, 'imgs')]:
+            if not isinstance(var, list):
+                raise TypeError(f'{name} must be a list, but got {type(var)}')
+        results_list = None
+        if len(img) == 1:
+            if hasattr(self, '__Kn_ONNX_Sess__'):
+                tmp = getattr(self, '__Kn_ONNX_Sess__').run(
+                    None, {'input': img[0].cpu().detach().numpy()})
+                device = torch.device(
+                    "cuda:0" if torch.cuda.is_available() else "cpu")
+                res = []
+                for o in tmp:
+                    res.append(torch.from_numpy(o).float().to(device))
+                pred = (F.softmax(res[0], dim=1) if res is not None else None)
+                results_list = self.head.post_process(pred)
+            return results_list
+        else:
+            raise NotImplementedError('aug_test has not been implemented')
